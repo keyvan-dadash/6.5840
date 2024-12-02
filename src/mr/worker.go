@@ -1,83 +1,354 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
+import (
+	"bufio"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"net/rpc"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
 
+	"github.com/google/uuid"
+)
 
-//
 // Map functions return a slice of KeyValue.
-//
 type KeyValue struct {
 	Key   string
 	Value string
 }
 
-//
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
-//
 func ihash(key string) int {
 	h := fnv.New32a()
 	h.Write([]byte(key))
 	return int(h.Sum32() & 0x7fffffff)
 }
 
+type WrokerState struct {
+	ID         string
+	Address    string
+	mapFunc    func(string, string) []KeyValue
+	reduceFunc func(string, []string) string
+	logger     *log.Logger
+}
 
-//
 // main/mrworker.go calls this function.
-//
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
-	// Your worker implementation here.
+	worker := &WrokerState{
+		ID:         uuid.New().String(),
+		Address:    "",
+		mapFunc:    mapf,
+		reduceFunc: reducef,
+		logger:     log.Default(),
+	}
 
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
+	go worker.sendHeartBeatForEver()
+	worker.runForEver()
+}
+
+func (w *WrokerState) sendHeartBeatForEver() error {
+	timer := time.NewTimer(time.Second * 2)
+	for {
+		select {
+		case <-timer.C:
+			{
+				args := HeartBeatArgs{
+					WorkerID:      w.ID,
+					WorkerAddress: w.Address,
+				}
+				reply := HeartBeatReply{}
+
+				ok := call("Coordinator.HeartBeat", &args, &reply)
+				if ok && reply.ReceivedHeartBeat {
+					continue
+				} else {
+					w.logger.Printf("failed to send heartbeat. Connected to Coordinator: %v, Coordinator response: %v", ok, reply.ReceivedHeartBeat)
+				}
+			}
+		}
+	}
 
 }
 
-//
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
+func (w *WrokerState) runForEver() error {
+	failedToContact := 0
+	for {
+		args := RequestJobArgs{
+			WorkerID:      w.ID,
+			WorkerAddress: w.Address,
+		}
 
-	// declare an argument structure.
-	args := ExampleArgs{}
+		reply := RequestJobReply{}
 
-	// fill in the argument(s).
-	args.X = 99
+		ok := call("Coordinator.RequestJob", &args, &reply)
+		if ok {
+			failedToContact = 0
+			switch reply.Job.JobType {
+			case kMapJobType:
+				{
+					w.logger.Printf(
+						"Got new map job. WorkerID: %v, JobID: %v, JobInfo: %v",
+						w.ID,
+						reply.Job.JobID,
+						reply.Job.JobInfo,
+					)
+					mapJob := &MapJob{}
+					if err := json.Unmarshal([]byte(reply.Job.JobInfo), mapJob); err != nil {
+						panic(err)
+					}
+					mapJobResult := w.runMap(mapJob, reply.Job.JobID)
+					b, err := json.Marshal(mapJobResult)
+					if err != nil {
+						panic(err)
+					}
 
-	// declare a reply structure.
-	reply := ExampleReply{}
+					w.SubmitJobResult(&JobResult{
+						JobID:         reply.Job.JobID,
+						JobType:       reply.Job.JobType,
+						JobResultInfo: string(b),
+					})
+				}
+			case kReduceJobType:
+				{
+					w.logger.Printf(
+						"Got new reduce job. WorkerID: %v, JobID: %v, JobInfo: %v",
+						w.ID,
+						reply.Job.JobID,
+						reply.Job.JobInfo,
+					)
+					reduceJob := &ReduceJob{}
+					if err := json.Unmarshal([]byte(reply.Job.JobInfo), reduceJob); err != nil {
+						panic(err)
+					}
 
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		fmt.Printf("call failed!\n")
+					reduceID, err := strconv.Atoi(reply.Job.JobID)
+					if err != nil {
+						panic(err)
+					}
+
+					reduceJobResult := w.runReduce(reduceJob, reduceID)
+
+					b, err := json.Marshal(reduceJobResult)
+					if err != nil {
+						panic(err)
+					}
+
+					w.SubmitJobResult(&JobResult{
+						JobID:         reply.Job.JobID,
+						JobType:       reply.Job.JobType,
+						JobResultInfo: string(b),
+					})
+				}
+			case kWaitJobType:
+				{
+					w.logger.Printf(
+						"Got new wait job. WorkerID: %v, JobID: %v, JobInfo: %v",
+						w.ID,
+						reply.Job.JobID,
+						reply.Job.JobInfo,
+					)
+					waitJob := &WaitJob{}
+					if err := json.Unmarshal([]byte(reply.Job.JobInfo), waitJob); err != nil {
+						panic(err)
+					}
+
+					time.Sleep(time.Duration(waitJob.TimeToWaitSec * int(time.Second)))
+				}
+			default:
+				{
+					return ErrJobTypeUnkown
+				}
+			}
+		} else {
+			failedToContact++
+			if failedToContact == 3 {
+				log.Fatal("failed to contact coordinator!")
+			}
+			time.Sleep(time.Second * 2)
+		}
 	}
 }
 
-//
+func (w *WrokerState) runMap(mapJob *MapJob, jobID string) *MapJobResult {
+	file, err := os.Open(mapJob.InputFile)
+	if err != nil {
+		log.Fatalf("cannot open %v", mapJob.InputFile)
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", mapJob.InputFile)
+	}
+	file.Close()
+
+	result := w.mapFunc(mapJob.InputFile, string(content))
+	paritionedKV := w.partitionResult(result, mapJob.PartionNum)
+
+	mapJobResult := &MapJobResult{
+		Keys: make(map[string]string),
+	}
+
+	for partitionNum, keyValues := range paritionedKV {
+		tempFile, err := os.CreateTemp(
+			".",
+			fmt.Sprintf("partition-%v-%v-%v-*.txt", w.ID, jobID, partitionNum),
+		)
+		if err != nil {
+			panic(err)
+		}
+		defer tempFile.Close()
+
+		for _, keyValue := range keyValues {
+			fmt.Fprintf(tempFile, "%v %v\n", keyValue.Key, keyValue.Value)
+		}
+
+		fileName := fmt.Sprintf("partition-worker-%v-job-%v-%v.txt", w.ID, jobID, partitionNum)
+		if err := os.Rename(tempFile.Name(), fileName); err != nil {
+			log.Fatal(err)
+		}
+		mapJobResult.Keys[partitionNum] = fileName
+	}
+
+	return mapJobResult
+}
+
+func (w *WrokerState) partitionResult(result []KeyValue, numOfPartition int) map[string][]KeyValue {
+	partitionedKV := make(map[string][]KeyValue)
+	for _, keyValue := range result {
+		paritionNumber := ihash(keyValue.Key) % numOfPartition
+		paritionedSet, ok := partitionedKV[strconv.Itoa(paritionNumber)]
+		if !ok {
+			partitionedKV[strconv.Itoa(paritionNumber)] = []KeyValue{keyValue}
+			continue
+		}
+		paritionedSet = append(paritionedSet, keyValue)
+		partitionedKV[strconv.Itoa(paritionNumber)] = paritionedSet
+	}
+
+	return partitionedKV
+}
+
+func (w *WrokerState) SubmitJobResult(job *JobResult) error {
+	args := JobDoneArgs{
+		WorkerID:  w.ID,
+		JobResult: *job,
+	}
+
+	reply := JobDoneReply{}
+
+	ok := call("Coordinator.JobDone", &args, &reply)
+	if ok {
+		return nil
+	} else {
+		return errors.New("could not submit the finished job")
+	}
+}
+
+func (w *WrokerState) runReduce(reduceJob *ReduceJob, reduceJobID int) *ReduceJobResult {
+	var intermediate []KeyValue
+	for _, inputFile := range reduceJob.InputFiles {
+		tmpKeyValue, err := w.parseIntermidateFile(inputFile)
+		if err != nil {
+			panic(err)
+		}
+		intermediate = append(intermediate, tmpKeyValue...)
+	}
+
+	tempFile, err := os.CreateTemp(".", fmt.Sprintf("mr-%v-*.txt", w.ID))
+	if err != nil {
+		panic(err)
+	}
+	defer tempFile.Close()
+
+	sort.Sort(ByKey(intermediate))
+
+	i := 0
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		output := w.reduceFunc(intermediate[i].Key, values)
+
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(tempFile, "%v %v\n", intermediate[i].Key, output)
+
+		i = j
+	}
+
+	fileName := fmt.Sprintf("mr-out-%v.txt", reduceJobID)
+	if err := os.Rename(tempFile.Name(), fileName); err != nil {
+		log.Fatal(err)
+	}
+
+	reduceJobResult := &ReduceJobResult{}
+	reduceJobResult.OutputFile = fileName
+	return reduceJobResult
+}
+
+func (w *WrokerState) parseIntermidateFile(fileLocation string) ([]KeyValue, error) {
+	file, err := os.Open(fileLocation)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open file: %v", err)
+	}
+	defer file.Close()
+
+	var keyValues []KeyValue
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue // Skip empty lines
+		}
+
+		var kv KeyValue
+		_, err := fmt.Sscanf(line, "%s %s", &kv.Key, &kv.Value)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse line '%s': %v", line, err)
+		}
+
+		keyValues = append(keyValues, kv)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("error reading file: %v", err)
+	}
+
+	return keyValues, nil
+}
+
 // send an RPC request to the coordinator, wait for the response.
 // usually returns true.
 // returns false if something goes wrong.
-//
 func call(rpcname string, args interface{}, reply interface{}) bool {
 	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
 	sockname := coordinatorSock()
 	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
-		log.Fatal("dialing:", err)
+		//log.Fatal("dialing:", err)
+		return false
 	}
 	defer c.Close()
 
