@@ -37,7 +37,8 @@ type RequestJobReply struct {
 
 type JobDoneArgs struct {
 	WorkerID  string
-	JobResult JobResult
+	JobID     string
+	JobResult string
 }
 
 type JobDoneReply struct {

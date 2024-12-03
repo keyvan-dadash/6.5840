@@ -1,7 +1,6 @@
 package mr
 
 import (
-	"encoding/json"
 	"log"
 	"net"
 	"net/http"
@@ -11,112 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
+	"6.5840/mr/utils"
 )
-
-const (
-	kAlive = iota
-
-	kDead
-)
-
-// WorkerInfo holds information of a worker
-type WorkerInfo struct {
-	// WorkerID shows the id of the worker
-	WorkerID string
-
-	// Address of the worker in case of contacting
-	Address string
-
-	// Status of the worker whether is alive or dead
-	Status int8
-
-	// NumOfMissedHB shows how many heatbeats has been passed since this worker did not respond
-	NumOfMissedHB int
-
-	lastHBTime time.Time
-
-	// FinishedJobs holds job's id of jobs that this worker has finished
-	FinishedJobs []string
-
-	// OngoingJob holds ID of a job that this worker is doing
-	OngoingJob string
-}
-
-func (w *WorkerInfo) FinishedCurrentJob() {
-	w.FinishedJobs = append(w.FinishedJobs, w.OngoingJob)
-	w.OngoingJob = "Idle"
-}
-
-func (w *WorkerInfo) FailCurrentJob() string {
-	currentJob := w.OngoingJob
-	w.OngoingJob = "Idle"
-	return currentJob
-}
-
-func (w *WorkerInfo) ClearFinishedJobs() {
-	w.FinishedJobs = []string{}
-}
-
-func (w *WorkerInfo) SetOngoingJob(jobID string) {
-	w.OngoingJob = jobID
-}
-
-func (w *WorkerInfo) PutWorkerOnWait() {
-	w.OngoingJob = "wait"
-}
-
-func (w WorkerInfo) IsOngoingJob() bool {
-	if w.OngoingJob == "Idle" || w.OngoingJob == "wait" {
-		return false
-	}
-	return true
-}
-
-func (w *WorkerInfo) ReceivedHB() {
-	w.NumOfMissedHB = 0
-	w.Status = kAlive
-	w.lastHBTime = time.Now()
-}
-
-func (w *WorkerInfo) CheckHBWithTime(baseDuration time.Duration) {
-	passedDuration := time.Now().Sub(w.lastHBTime)
-	w.NumOfMissedHB += int(passedDuration / baseDuration)
-	if w.NumOfMissedHB > 5 {
-		w.Status = kDead
-	}
-}
-
-func (w *WorkerInfo) MarkAlive() {
-	w.Status = kAlive
-}
-
-func (w *WorkerInfo) MarkDead() {
-	w.Status = kDead
-}
-
-func (w *WorkerInfo) IsDead() bool {
-	return w.Status == kDead
-}
-
-type JobInfo struct {
-	Job       Job
-	JobResult JobResult
-	JobStatus int8
-}
-
-func (j *JobInfo) IsMapJob() bool {
-	return j.Job.JobType == kMapJobType
-}
-
-func (j *JobInfo) IsReduceJob() bool {
-	return j.Job.JobType == kReduceJobType
-}
-
-func (j *JobInfo) FailJob() {
-	j.JobStatus = kFailedJob
-	j.JobResult = JobResult{}
-}
 
 // Coordinator holds information about a Coordinator
 type Coordinator struct {
@@ -127,7 +22,7 @@ type Coordinator struct {
 	InputFiles []string
 
 	// Jobs are the total jobs that need to be done
-	Jobs map[string]*JobInfo
+	Jobs map[string]*Job
 
 	// NReduce of reduce jobs
 	NReduce int
@@ -150,35 +45,21 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		mapJobsDone:    false,
 		reduceJobsDone: false,
 		requestLock:    &sync.Mutex{},
-		Jobs:           make(map[string]*JobInfo),
+		Jobs:           make(map[string]*Job),
 	}
 
 	for _, file := range files {
-		mapJobInfo := &MapJob{InputFile: file, PartionNum: nReduce}
-		b, err := json.Marshal(mapJobInfo)
-		if err != nil {
-			panic(err)
-		}
-
-		jobID := uuid.New().String()
-		c.Jobs[jobID] = &JobInfo{
-			Job: Job{
-				JobID:   jobID,
-				JobType: kMapJobType,
-				JobInfo: string(b),
-			},
-			JobStatus: kUnfinishedJob,
-		}
+		mapJobInfo := CreateMapJob(file, nReduce)
+		job := CreateJob(kMapJobType)
+		job.SetJobDetail(utils.ToJson(mapJobInfo))
+		c.Jobs[job.JobID] = job
 	}
 
 	for i := 0; i < nReduce; i++ {
-		c.Jobs[strconv.Itoa(i)] = &JobInfo{
-			Job: Job{
-				JobID:   strconv.Itoa(i),
-				JobType: kReduceJobType,
-			},
-			JobStatus: kUnfinishedJob,
-		}
+		reduceJobInfo := CreaReduceJob(i, []string{})
+		job := CreateJob(kReduceJobType)
+		job.SetJobDetail(utils.ToJson(reduceJobInfo))
+		c.Jobs[job.JobID] = job
 	}
 
 	c.server()
@@ -193,52 +74,73 @@ func (c *Coordinator) RequestJob(args *RequestJobArgs, reply *RequestJobReply) e
 
 	worker, isExistingWorker := c.Workers[args.WorkerID]
 	if !isExistingWorker {
-		worker = &WorkerInfo{
-			WorkerID:      args.WorkerID,
-			Address:       args.WorkerAddress,
-			Status:        kAlive,
-			NumOfMissedHB: 0,
-		}
+		worker = CreateWorkerInfo(args.WorkerID, args.WorkerAddress)
 		c.Workers[args.WorkerID] = worker
 	}
 	worker.ReceivedHB()
 
-	onGoingJob := false
-	for _, jobInfo := range c.Jobs {
-		if !jobInfo.IsMapJob() {
-			continue
-		}
+	c.mapJobsDone = false
+	c.reduceJobsDone = false
 
-		if jobInfo.JobStatus == kUnfinishedJob || jobInfo.JobStatus == kFailedJob {
-			reply.Job = jobInfo.Job
-			jobInfo.JobStatus = kOngoingJob
-			worker.SetOngoingJob(jobInfo.Job.JobID)
-			return nil
-		} else if jobInfo.JobStatus == kOngoingJob {
-			onGoingJob = true
-		}
+	mapJob, shouldWait := c.getMapJob()
+	if mapJob != nil {
+		mapJob.PutJobOnGoing()
+		reply.Job = *mapJob
+		worker.SetOngoingJob(mapJob.JobID)
+		return nil
 	}
 
-	if onGoingJob {
-		waitJob := &WaitJob{TimeToWaitSec: 2}
-		b, err := json.Marshal(waitJob)
-		if err != nil {
-			panic(err)
-		}
-
-		reply.Job = Job{
-			JobID:   "",
-			JobType: kWaitJobType,
-			JobInfo: string(b),
-		}
-
+	if shouldWait {
+		waitJob := CreateWaitJob(2)
+		job := CreateJob(kWaitJobType)
+		job.SetJobDetail(utils.ToJson(waitJob))
+		reply.Job = *job
 		worker.PutWorkerOnWait()
 		return nil
 	}
 
 	c.mapJobsDone = true
 
-	// Reduce phase
+	reduceJob, shouldWait := c.getReduceJob()
+	if reduceJob != nil {
+		reduceJob.PutJobOnGoing()
+		reply.Job = *reduceJob
+		worker.SetOngoingJob(reduceJob.JobID)
+		return nil
+	}
+
+	if shouldWait {
+		waitJob := CreateWaitJob(2)
+		job := CreateJob(kWaitJobType)
+		job.SetJobDetail(utils.ToJson(waitJob))
+		reply.Job = *job
+		worker.PutWorkerOnWait()
+		return nil
+	}
+
+	c.reduceJobsDone = true
+
+	// TODO: instruct worker to exit
+	return nil
+}
+
+func (c *Coordinator) getMapJob() (*Job, bool) {
+	for _, job := range c.Jobs {
+		if !job.IsMapJob() {
+			continue
+		}
+
+		if job.jobStatus == kUnfinishedJob || job.jobStatus == kFailedJob {
+			return job, false
+		} else if job.jobStatus == kOngoingJob {
+			return nil, true
+		}
+	}
+
+	return nil, false
+}
+
+func (c *Coordinator) getReduceJob() (*Job, bool) {
 	ongoingReduceJob := false
 	intermediateFiles := []string{}
 	for _, reduceJobInfo := range c.Jobs {
@@ -246,11 +148,10 @@ func (c *Coordinator) RequestJob(args *RequestJobArgs, reply *RequestJobReply) e
 			continue
 		}
 
-		if reduceJobInfo.JobStatus == kFinishedJob || reduceJobInfo.JobStatus == kOngoingJob {
-			if reduceJobInfo.JobStatus == kOngoingJob {
+		if reduceJobInfo.jobStatus == kFinishedJob || reduceJobInfo.jobStatus == kOngoingJob {
+			if reduceJobInfo.jobStatus == kOngoingJob {
 				ongoingReduceJob = true
 			}
-
 			continue
 		}
 
@@ -259,48 +160,26 @@ func (c *Coordinator) RequestJob(args *RequestJobArgs, reply *RequestJobReply) e
 				continue
 			}
 
+			reduceJobDetail := &ReduceJob{}
+			utils.FromJson(reduceJobInfo.JobDetail, reduceJobDetail)
+
 			mapJobResult := &MapJobResult{}
-			if err := json.Unmarshal([]byte(mapJobInfo.JobResult.JobResultInfo), mapJobResult); err != nil {
-				panic(err)
-			}
-			fileLocation, ok := mapJobResult.Keys[reduceJobInfo.Job.JobID]
+			utils.FromJson(mapJobInfo.jobResult, mapJobResult)
+			fileLocation, ok := mapJobResult.Keys[strconv.Itoa(reduceJobDetail.ReduceID)]
 			if ok {
 				intermediateFiles = append(intermediateFiles, fileLocation)
 			}
 		}
 
-		reduceJob := &ReduceJob{
-			InputFiles: intermediateFiles,
-		}
-		b, err := json.Marshal(reduceJob)
-		if err != nil {
-			panic(err)
-		}
+		reduceJob := &ReduceJob{}
+		utils.FromJson(reduceJobInfo.JobDetail, reduceJob)
+		reduceJob.InputFiles = intermediateFiles
+		reduceJobInfo.SetJobDetail(utils.ToJson(reduceJob))
 
-		reduceJobInfo.Job.JobInfo = string(b)
-		reduceJobInfo.JobStatus = kOngoingJob
-
-		reply.Job = reduceJobInfo.Job
-		worker.SetOngoingJob(reduceJobInfo.Job.JobID)
-		return nil
+		return reduceJobInfo, false
 	}
 
-	if !ongoingReduceJob {
-		c.reduceJobsDone = true
-	}
-	waitJob := &WaitJob{TimeToWaitSec: 2}
-	b, err := json.Marshal(waitJob)
-	if err != nil {
-		panic(err)
-	}
-
-	reply.Job = Job{
-		JobID:   "",
-		JobType: kWaitJobType,
-		JobInfo: string(b),
-	}
-	worker.PutWorkerOnWait()
-	return nil
+	return nil, ongoingReduceJob
 }
 
 func (c *Coordinator) JobDone(args *JobDoneArgs, reply *JobDoneReply) error {
@@ -309,31 +188,14 @@ func (c *Coordinator) JobDone(args *JobDoneArgs, reply *JobDoneReply) error {
 
 	worker, _ := c.Workers[args.WorkerID]
 	worker.ReceivedHB()
-	switch args.JobResult.JobType {
-	case kMapJobType:
-		{
-			jobInfo := c.Jobs[args.JobResult.JobID]
-			if worker.IsOngoingJob() {
-				jobInfo.JobResult = args.JobResult
-				jobInfo.JobStatus = kFinishedJob
-				worker.FinishedCurrentJob()
-				worker.ReceivedHB()
-			}
-			return nil
-		}
-	case kReduceJobType:
-		{
-			jobInfo := c.Jobs[args.JobResult.JobID]
-			if worker.IsOngoingJob() {
-				jobInfo.JobResult = args.JobResult
-				jobInfo.JobStatus = kFinishedJob
-				worker.FinishedCurrentJob()
-				worker.ReceivedHB()
-			}
-			return nil
-		}
+	job, _ := c.Jobs[args.JobID]
+	if worker.IsOngoingJob() {
+		job.SetJobResult(args.JobResult)
+		job.jobStatus = kFinishedJob
+		worker.FinishedCurrentJob()
+		worker.ReceivedHB()
 	}
-	return ErrJobTypeUnkown
+	return nil
 }
 
 func (c *Coordinator) HeartBeat(args *HeartBeatArgs, reply *HeartBeatReply) error {
@@ -342,12 +204,7 @@ func (c *Coordinator) HeartBeat(args *HeartBeatArgs, reply *HeartBeatReply) erro
 
 	worker, isExistingWorker := c.Workers[args.WorkerID]
 	if !isExistingWorker {
-		worker = &WorkerInfo{
-			WorkerID:      args.WorkerID,
-			Address:       args.WorkerAddress,
-			Status:        kAlive,
-			NumOfMissedHB: 0,
-		}
+		worker = CreateWorkerInfo(args.WorkerID, args.WorkerAddress)
 		c.Workers[args.WorkerID] = worker
 	}
 	worker.ReceivedHB()
@@ -379,13 +236,21 @@ func (c *Coordinator) handleFailedWorker(worker *WorkerInfo) {
 	if worker.IsOngoingJob() {
 		ongoingJobID := worker.FailCurrentJob()
 		job, _ := c.Jobs[ongoingJobID]
-		job.FailJob()
+		job.FailedJob()
 	}
 
 	for _, jobID := range worker.FinishedJobs {
 		job, _ := c.Jobs[jobID]
 		if job.IsMapJob() {
-			job.FailJob()
+
+			// In the local mode for passing the crash test the below line should be commented.
+			// The reason is that if a worker fails, we have to do its crossponding map tasks again
+			// so that subsequent reduce tasks start, otherwise we keep re-assigning map task since
+			// the coordinator assumes that the worker failed so other workers dont have access to the failed worker's map tasks' files.
+			// Thus, the coordinator reschedules map tasks agian. However, as TA stated in discussion, a done task should not be redone.
+			// Therefore, for keeping TA's word we have to comment this. Nonetheless, in case of disitrbuted implementation, as it is stated in the bonus part,
+			// we have to have this line so that we have correct implementation.
+			//job.FailedJob()
 			continue
 		}
 	}

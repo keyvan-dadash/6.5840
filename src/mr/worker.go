@@ -2,7 +2,6 @@ package mr
 
 import (
 	"bufio"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -16,6 +15,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"6.5840/mr/utils"
 )
 
 // Map functions return a slice of KeyValue.
@@ -80,7 +81,7 @@ func (w *WrokerState) sendHeartBeatForEver() error {
 				if ok && reply.ReceivedHeartBeat {
 					continue
 				} else {
-					w.logger.Printf("failed to send heartbeat. Connected to Coordinator: %v, Coordinator response: %v", ok, reply.ReceivedHeartBeat)
+					w.logger.Printf("failed to send heartbeat. RPC status: %v, Coordinator response: %v", ok, reply.ReceivedHeartBeat)
 				}
 			}
 		}
@@ -108,23 +109,13 @@ func (w *WrokerState) runForEver() error {
 						"Got new map job. WorkerID: %v, JobID: %v, JobInfo: %v",
 						w.ID,
 						reply.Job.JobID,
-						reply.Job.JobInfo,
+						reply.Job.JobDetail,
 					)
 					mapJob := &MapJob{}
-					if err := json.Unmarshal([]byte(reply.Job.JobInfo), mapJob); err != nil {
-						panic(err)
-					}
+					utils.FromJson(reply.Job.JobDetail, mapJob)
 					mapJobResult := w.runMap(mapJob, reply.Job.JobID)
-					b, err := json.Marshal(mapJobResult)
-					if err != nil {
-						panic(err)
-					}
-
-					w.SubmitJobResult(&JobResult{
-						JobID:         reply.Job.JobID,
-						JobType:       reply.Job.JobType,
-						JobResultInfo: string(b),
-					})
+					reply.Job.SetJobResult(utils.ToJson(mapJobResult))
+					w.SubmitJobResult(&reply.Job)
 				}
 			case kReduceJobType:
 				{
@@ -132,30 +123,13 @@ func (w *WrokerState) runForEver() error {
 						"Got new reduce job. WorkerID: %v, JobID: %v, JobInfo: %v",
 						w.ID,
 						reply.Job.JobID,
-						reply.Job.JobInfo,
+						reply.Job.JobDetail,
 					)
 					reduceJob := &ReduceJob{}
-					if err := json.Unmarshal([]byte(reply.Job.JobInfo), reduceJob); err != nil {
-						panic(err)
-					}
-
-					reduceID, err := strconv.Atoi(reply.Job.JobID)
-					if err != nil {
-						panic(err)
-					}
-
-					reduceJobResult := w.runReduce(reduceJob, reduceID)
-
-					b, err := json.Marshal(reduceJobResult)
-					if err != nil {
-						panic(err)
-					}
-
-					w.SubmitJobResult(&JobResult{
-						JobID:         reply.Job.JobID,
-						JobType:       reply.Job.JobType,
-						JobResultInfo: string(b),
-					})
+					utils.FromJson(reply.Job.JobDetail, reduceJob)
+					reduceJobResult := w.runReduce(reduceJob, reduceJob.ReduceID)
+					reply.Job.SetJobResult(utils.ToJson(reduceJobResult))
+					w.SubmitJobResult(&reply.Job)
 				}
 			case kWaitJobType:
 				{
@@ -163,13 +137,10 @@ func (w *WrokerState) runForEver() error {
 						"Got new wait job. WorkerID: %v, JobID: %v, JobInfo: %v",
 						w.ID,
 						reply.Job.JobID,
-						reply.Job.JobInfo,
+						reply.Job.JobDetail,
 					)
 					waitJob := &WaitJob{}
-					if err := json.Unmarshal([]byte(reply.Job.JobInfo), waitJob); err != nil {
-						panic(err)
-					}
-
+					utils.FromJson(reply.Job.JobDetail, waitJob)
 					time.Sleep(time.Duration(waitJob.TimeToWaitSec * int(time.Second)))
 				}
 			default:
@@ -245,10 +216,11 @@ func (w *WrokerState) partitionResult(result []KeyValue, numOfPartition int) map
 	return partitionedKV
 }
 
-func (w *WrokerState) SubmitJobResult(job *JobResult) error {
+func (w *WrokerState) SubmitJobResult(job *Job) error {
 	args := JobDoneArgs{
 		WorkerID:  w.ID,
-		JobResult: *job,
+		JobID:     job.JobID,
+		JobResult: job.jobResult,
 	}
 
 	reply := JobDoneReply{}
