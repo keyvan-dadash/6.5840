@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -55,6 +56,7 @@ type WorkerState struct {
 	reduceFunc         func(string, []string) string
 	logger             *log.Logger
 	producedFiles      []string
+	mutex              *sync.Mutex
 }
 
 // main/mrworker.go calls this function.
@@ -68,6 +70,7 @@ func Worker(mapf func(string, string) []KeyValue,
 		mapFunc:            mapf,
 		reduceFunc:         reducef,
 		logger:             log.Default(),
+		mutex:              &sync.Mutex{},
 	}
 
 	go worker.sendHeartBeatForEver()
@@ -238,7 +241,10 @@ func (w *WorkerState) runMap(mapJob *MapJob, jobID string) *MapJobResult {
 			"WorkerState.RequestFile",
 			IsLocal,
 		)
+
+		w.mutex.Lock()
 		w.producedFiles = append(w.producedFiles, fileName)
+		w.mutex.Unlock()
 	}
 
 	return mapJobResult
@@ -276,7 +282,11 @@ func (w *WorkerState) fetchFilesInParallel(inputFiles []File) ([]*os.File, error
 }
 
 func (w WorkerState) fetchFile(inputFile *File) (*os.File, error) {
-	if !inputFile.IsLocal && !utils.Contains(w.producedFiles, inputFile.FileName) {
+	w.mutex.Lock()
+	isInLocal := utils.Contains(w.producedFiles, inputFile.FileName)
+	w.mutex.Unlock()
+
+	if !inputFile.IsLocal && !isInLocal {
 		reply := &RequestFileReply{}
 		ok := call(inputFile.RPCName, inputFile.NetAddressToGetFile, &RequestFileArgs{
 			FileName: inputFile.FileName,
@@ -439,6 +449,11 @@ func (w *WorkerState) RequestFile(args *RequestFileArgs, reply *RequestFileReply
 
 	fileBase64, err := utils.FileToBase64(args.FileName)
 	if err != nil {
+		w.logger.Printf(
+			"cannot get the requested file! filename: %v, reason: %v\n",
+			args.FileName,
+			err,
+		)
 		return err
 	}
 	reply.FileBase64 = fileBase64
