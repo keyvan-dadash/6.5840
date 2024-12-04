@@ -44,6 +44,14 @@ type JobDoneArgs struct {
 type JobDoneReply struct {
 }
 
+type JobFailedArgs struct {
+	WorkerID string
+	JobID    string
+}
+
+type JobFailedReply struct {
+}
+
 type HeartBeatArgs struct {
 	WorkerID      string
 	WorkerAddress string
@@ -51,6 +59,14 @@ type HeartBeatArgs struct {
 
 type HeartBeatReply struct {
 	ReceivedHeartBeat bool
+}
+
+type RequestFileArgs struct {
+	FileName string
+}
+
+type RequestFileReply struct {
+	FileBase64 string
 }
 
 // Cook up a unique-ish UNIX-domain socket name

@@ -92,11 +92,11 @@ func (j *Job) SetJobResult(jobResult string) {
 }
 
 type MapJob struct {
-	InputFile  string
+	InputFile  File
 	PartionNum int
 }
 
-func CreateMapJob(InputFile string, ParitionNum int) *MapJob {
+func CreateMapJob(InputFile File, ParitionNum int) *MapJob {
 	return &MapJob{
 		InputFile:  InputFile,
 		PartionNum: ParitionNum,
@@ -105,10 +105,10 @@ func CreateMapJob(InputFile string, ParitionNum int) *MapJob {
 
 type ReduceJob struct {
 	ReduceID   int
-	InputFiles []string
+	InputFiles []File
 }
 
-func CreaReduceJob(reduceID int, inputFiles []string) *ReduceJob {
+func CreaReduceJob(reduceID int, inputFiles []File) *ReduceJob {
 	return &ReduceJob{
 		ReduceID:   reduceID,
 		InputFiles: inputFiles,
@@ -126,21 +126,23 @@ func CreateWaitJob(timeToWait int) *WaitJob {
 }
 
 type MapJobResult struct {
-	Keys map[string]string
+	Keys map[string]File
 }
 
 func CreaMapJobResult() *MapJobResult {
 	return &MapJobResult{
-		Keys: make(map[string]string),
+		Keys: make(map[string]File),
 	}
 }
 
 type ReduceJobResult struct {
-	OutputFile string
+	OutputFileName   string
+	OutputFileBase64 string
 }
 
-func CreateReduceJobResult(outputFile string) *ReduceJobResult {
+func CreateReduceJobResult(outputFileName, outputFileBase64 string) *ReduceJobResult {
 	return &ReduceJobResult{
-		OutputFile: outputFile,
+		OutputFileName:   outputFileName,
+		OutputFileBase64: outputFileBase64,
 	}
 }

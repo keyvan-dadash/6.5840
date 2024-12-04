@@ -1,6 +1,7 @@
 package mr
 
 import (
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -17,6 +18,8 @@ import (
 type Coordinator struct {
 	// Workers that are available
 	Workers map[string]*WorkerInfo
+
+	CoordinatorAddress string
 
 	// InputFiles to be processed
 	InputFiles []string
@@ -39,24 +42,28 @@ type Coordinator struct {
 // nReduce is the number of reduce jobs to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{
-		Workers:        make(map[string]*WorkerInfo),
-		InputFiles:     files,
-		NReduce:        nReduce,
-		mapJobsDone:    false,
-		reduceJobsDone: false,
-		requestLock:    &sync.Mutex{},
-		Jobs:           make(map[string]*Job),
+		Workers:            make(map[string]*WorkerInfo),
+		CoordinatorAddress: fmt.Sprintf("%v:%v", CoordinatorIPAddress, CoordinatorPort),
+		InputFiles:         files,
+		NReduce:            nReduce,
+		mapJobsDone:        false,
+		reduceJobsDone:     false,
+		requestLock:        &sync.Mutex{},
+		Jobs:               make(map[string]*Job),
 	}
 
 	for _, file := range files {
-		mapJobInfo := CreateMapJob(file, nReduce)
+		mapJobInfo := CreateMapJob(
+			CreateFile(file, c.CoordinatorAddress, "Coordinator.RequestFile", IsLocal),
+			nReduce,
+		)
 		job := CreateJob(kMapJobType)
 		job.SetJobDetail(utils.ToJson(mapJobInfo))
 		c.Jobs[job.JobID] = job
 	}
 
 	for i := 0; i < nReduce; i++ {
-		reduceJobInfo := CreaReduceJob(i, []string{})
+		reduceJobInfo := CreaReduceJob(i, []File{})
 		job := CreateJob(kReduceJobType)
 		job.SetJobDetail(utils.ToJson(reduceJobInfo))
 		c.Jobs[job.JobID] = job
@@ -142,7 +149,7 @@ func (c *Coordinator) getMapJob() (*Job, bool) {
 
 func (c *Coordinator) getReduceJob() (*Job, bool) {
 	ongoingReduceJob := false
-	intermediateFiles := []string{}
+	intermediateFiles := []File{}
 	for _, reduceJobInfo := range c.Jobs {
 		if !reduceJobInfo.IsReduceJob() {
 			continue
@@ -198,6 +205,21 @@ func (c *Coordinator) JobDone(args *JobDoneArgs, reply *JobDoneReply) error {
 	return nil
 }
 
+func (c *Coordinator) JobFailed(args *JobFailedArgs, reply *JobFailedReply) error {
+	c.requestLock.Lock()
+	defer c.requestLock.Unlock()
+
+	worker, _ := c.Workers[args.WorkerID]
+	worker.ReceivedHB()
+	job, _ := c.Jobs[args.JobID]
+	if worker.IsOngoingJob() {
+		job.jobStatus = kFailedJob
+		worker.FailCurrentJob()
+		worker.ReceivedHB()
+	}
+	return nil
+}
+
 func (c *Coordinator) HeartBeat(args *HeartBeatArgs, reply *HeartBeatReply) error {
 	c.requestLock.Lock()
 	defer c.requestLock.Unlock()
@@ -209,6 +231,20 @@ func (c *Coordinator) HeartBeat(args *HeartBeatArgs, reply *HeartBeatReply) erro
 	}
 	worker.ReceivedHB()
 	reply.ReceivedHeartBeat = true
+	return nil
+}
+
+func (c *Coordinator) RequestFile(args *RequestFileArgs, reply *RequestFileReply) error {
+	if !utils.Contains(c.InputFiles, args.FileName) {
+		// TODO: eroor?
+		panic(nil)
+	}
+
+	fileBase64, err := utils.FileToBase64(args.FileName)
+	if err != nil {
+		return err
+	}
+	reply.FileBase64 = fileBase64
 	return nil
 }
 
@@ -241,16 +277,8 @@ func (c *Coordinator) handleFailedWorker(worker *WorkerInfo) {
 
 	for _, jobID := range worker.FinishedJobs {
 		job, _ := c.Jobs[jobID]
-		if job.IsMapJob() {
-
-			// In the local mode for passing the crash test the below line should be commented.
-			// The reason is that if a worker fails, we have to do its crossponding map tasks again
-			// so that subsequent reduce tasks start, otherwise we keep re-assigning map task since
-			// the coordinator assumes that the worker failed so other workers dont have access to the failed worker's map tasks' files.
-			// Thus, the coordinator reschedules map tasks agian. However, as TA stated in discussion, a done task should not be redone.
-			// Therefore, for keeping TA's word we have to comment this. Nonetheless, in case of disitrbuted implementation, as it is stated in the bonus part,
-			// we have to have this line so that we have correct implementation.
-			//job.FailedJob()
+		if job.IsMapJob() && !IsLocal {
+			job.FailedJob()
 			continue
 		}
 	}
@@ -262,10 +290,18 @@ func (c *Coordinator) handleFailedWorker(worker *WorkerInfo) {
 func (c *Coordinator) server() {
 	rpc.Register(c)
 	rpc.HandleHTTP()
-	//l, e := net.Listen("tcp", ":1234")
-	sockname := coordinatorSock()
-	os.Remove(sockname)
-	l, e := net.Listen("unix", sockname)
+
+	var l net.Listener
+	var e error
+
+	if !IsLocal {
+		l, e = net.Listen("tcp", fmt.Sprintf(":%v", CoordinatorPort))
+	} else {
+		sockname := coordinatorSock()
+		os.Remove(sockname)
+		l, e = net.Listen("unix", sockname)
+	}
+
 	if e != nil {
 		log.Fatal("listen error:", e)
 	}
@@ -279,5 +315,26 @@ func (c *Coordinator) Done() bool {
 	defer c.requestLock.Unlock()
 
 	ret := c.mapJobsDone && c.reduceJobsDone
+
+	if ret && !IsLocal {
+		// dump reduce files to local
+		for _, job := range c.Jobs {
+			if !job.IsReduceJob() {
+				continue
+			}
+
+			reduceJobDetail := &ReduceJob{}
+			utils.FromJson(job.JobDetail, reduceJobDetail)
+
+			reduceJobResult := &ReduceJobResult{}
+			utils.FromJson(job.jobResult, reduceJobResult)
+
+			fileName := fmt.Sprintf("mr-out-%v.txt", reduceJobDetail.ReduceID)
+			if err := utils.Base64ToFile(reduceJobResult.OutputFileBase64, fileName); err != nil {
+				panic(err)
+			}
+		}
+	}
+
 	return ret
 }

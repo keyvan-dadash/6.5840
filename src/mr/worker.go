@@ -7,6 +7,8 @@ import (
 	"hash/fnv"
 	"io/ioutil"
 	"log"
+	"net"
+	"net/http"
 	"net/rpc"
 	"os"
 	"sort"
@@ -17,6 +19,10 @@ import (
 	"github.com/google/uuid"
 
 	"6.5840/mr/utils"
+)
+
+var (
+	ErrFailedToContactNode = errors.New("failed to contact a node for getting information")
 )
 
 // Map functions return a slice of KeyValue.
@@ -41,21 +47,22 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-type WrokerState struct {
-	ID         string
-	Address    string
-	mapFunc    func(string, string) []KeyValue
-	reduceFunc func(string, []string) string
-	logger     *log.Logger
+type WorkerState struct {
+	ID            string
+	Address       string
+	mapFunc       func(string, string) []KeyValue
+	reduceFunc    func(string, []string) string
+	logger        *log.Logger
+	producedFiles []string
 }
 
 // main/mrworker.go calls this function.
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
-	worker := &WrokerState{
+	worker := &WorkerState{
 		ID:         uuid.New().String(),
-		Address:    "",
+		Address:    fmt.Sprintf("%v:%v", WorkerIPAddress, WorkerPort),
 		mapFunc:    mapf,
 		reduceFunc: reducef,
 		logger:     log.Default(),
@@ -65,7 +72,7 @@ func Worker(mapf func(string, string) []KeyValue,
 	worker.runForEver()
 }
 
-func (w *WrokerState) sendHeartBeatForEver() error {
+func (w *WorkerState) sendHeartBeatForEver() error {
 	timer := time.NewTimer(time.Second * 2)
 	for {
 		select {
@@ -89,7 +96,7 @@ func (w *WrokerState) sendHeartBeatForEver() error {
 
 }
 
-func (w *WrokerState) runForEver() error {
+func (w *WorkerState) runForEver() error {
 	failedToContact := 0
 	for {
 		args := RequestJobArgs{
@@ -114,6 +121,17 @@ func (w *WrokerState) runForEver() error {
 					mapJob := &MapJob{}
 					utils.FromJson(reply.Job.JobDetail, mapJob)
 					mapJobResult := w.runMap(mapJob, reply.Job.JobID)
+					if mapJobResult == nil {
+						w.logger.Printf(
+							"map job failed! worker_id: %v, job_id %v, job_detail: %v\n",
+							w.ID,
+							reply.Job.JobID,
+							reply.Job.JobDetail,
+						)
+						w.SubmitJobFailed(&reply.Job)
+						continue
+					}
+
 					reply.Job.SetJobResult(utils.ToJson(mapJobResult))
 					w.SubmitJobResult(&reply.Job)
 				}
@@ -128,6 +146,17 @@ func (w *WrokerState) runForEver() error {
 					reduceJob := &ReduceJob{}
 					utils.FromJson(reply.Job.JobDetail, reduceJob)
 					reduceJobResult := w.runReduce(reduceJob, reduceJob.ReduceID)
+					if reduceJobResult == nil {
+						w.logger.Printf(
+							"reduce job failed! worker_id: %v, job_id %v, job_detail: %v\n",
+							w.ID,
+							reply.Job.JobID,
+							reply.Job.JobDetail,
+						)
+						w.SubmitJobFailed(&reply.Job)
+						continue
+					}
+
 					reply.Job.SetJobResult(utils.ToJson(reduceJobResult))
 					w.SubmitJobResult(&reply.Job)
 				}
@@ -158,22 +187,28 @@ func (w *WrokerState) runForEver() error {
 	}
 }
 
-func (w *WrokerState) runMap(mapJob *MapJob, jobID string) *MapJobResult {
-	file, err := os.Open(mapJob.InputFile)
+func (w *WorkerState) runMap(mapJob *MapJob, jobID string) *MapJobResult {
+	file, err := w.fetchFile(&mapJob.InputFile)
 	if err != nil {
-		log.Fatalf("cannot open %v", mapJob.InputFile)
+		if errors.Is(err, ErrFailedToContactNode) {
+			// this means coordinator has been failed
+			return nil
+		} else {
+			panic(err)
+		}
 	}
+
 	content, err := ioutil.ReadAll(file)
 	if err != nil {
 		log.Fatalf("cannot read %v", mapJob.InputFile)
 	}
 	file.Close()
 
-	result := w.mapFunc(mapJob.InputFile, string(content))
+	result := w.mapFunc(mapJob.InputFile.FileName, string(content))
 	paritionedKV := w.partitionResult(result, mapJob.PartionNum)
 
 	mapJobResult := &MapJobResult{
-		Keys: make(map[string]string),
+		Keys: make(map[string]File),
 	}
 
 	for partitionNum, keyValues := range paritionedKV {
@@ -194,13 +229,74 @@ func (w *WrokerState) runMap(mapJob *MapJob, jobID string) *MapJobResult {
 		if err := os.Rename(tempFile.Name(), fileName); err != nil {
 			log.Fatal(err)
 		}
-		mapJobResult.Keys[partitionNum] = fileName
+		mapJobResult.Keys[partitionNum] = CreateFile(
+			fileName,
+			w.Address,
+			"WorkerState.RequestFile",
+			IsLocal,
+		)
+		w.producedFiles = append(w.producedFiles, fileName)
 	}
 
 	return mapJobResult
 }
 
-func (w *WrokerState) partitionResult(result []KeyValue, numOfPartition int) map[string][]KeyValue {
+func (w *WorkerState) fetchFilesInParallel(inputFiles []File) ([]*os.File, error) {
+	osFileCh := make(chan *os.File)
+	errCh := make(chan error)
+	for _, file := range inputFiles {
+		go func(file File) {
+			osFile, err := w.fetchFile(&file)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			osFileCh <- osFile
+		}(file)
+	}
+
+	osFiles := []*os.File{}
+	for i := 0; i < len(inputFiles); i++ {
+		select {
+		case osFile := <-osFileCh:
+			{
+				osFiles = append(osFiles, osFile)
+			}
+		case err := <-errCh:
+			{
+				return nil, err
+			}
+		}
+	}
+
+	return osFiles, nil
+}
+
+func (w WorkerState) fetchFile(inputFile *File) (*os.File, error) {
+	if !inputFile.IsLocal && !utils.Contains(w.producedFiles, inputFile.FileName) {
+		reply := &RequestFileReply{}
+		ok := call(inputFile.RPCName, &RequestFileArgs{
+			FileName: inputFile.FileName,
+		}, reply)
+
+		if ok {
+			if err := utils.Base64ToFile(reply.FileBase64, inputFile.FileName); err != nil {
+				panic(err)
+			}
+
+		} else {
+			return nil, ErrFailedToContactNode
+		}
+	}
+
+	file, err := os.Open(inputFile.FileName)
+	if err != nil {
+		log.Fatalf("cannot open %v", inputFile.FileName)
+	}
+	return file, nil
+}
+
+func (w *WorkerState) partitionResult(result []KeyValue, numOfPartition int) map[string][]KeyValue {
 	partitionedKV := make(map[string][]KeyValue)
 	for _, keyValue := range result {
 		paritionNumber := ihash(keyValue.Key) % numOfPartition
@@ -216,7 +312,7 @@ func (w *WrokerState) partitionResult(result []KeyValue, numOfPartition int) map
 	return partitionedKV
 }
 
-func (w *WrokerState) SubmitJobResult(job *Job) error {
+func (w *WorkerState) SubmitJobResult(job *Job) error {
 	args := JobDoneArgs{
 		WorkerID:  w.ID,
 		JobID:     job.JobID,
@@ -233,9 +329,33 @@ func (w *WrokerState) SubmitJobResult(job *Job) error {
 	}
 }
 
-func (w *WrokerState) runReduce(reduceJob *ReduceJob, reduceJobID int) *ReduceJobResult {
+func (w *WorkerState) SubmitJobFailed(job *Job) error {
+	args := JobFailedArgs{
+		WorkerID: w.ID,
+		JobID:    job.JobID,
+	}
+
+	reply := JobFailedReply{}
+
+	ok := call("Coordinator.JobFailed", &args, &reply)
+	if ok {
+		return nil
+	} else {
+		return errors.New("could not submit the failed job")
+	}
+}
+
+func (w *WorkerState) runReduce(reduceJob *ReduceJob, reduceJobID int) *ReduceJobResult {
+	intermidateFiles, err := w.fetchFilesInParallel(reduceJob.InputFiles)
+	if err != nil {
+		if errors.Is(err, ErrFailedToContactNode) {
+			return nil
+		}
+		panic(err)
+	}
+
 	var intermediate []KeyValue
-	for _, inputFile := range reduceJob.InputFiles {
+	for _, inputFile := range intermidateFiles {
 		tmpKeyValue, err := w.parseIntermidateFile(inputFile)
 		if err != nil {
 			panic(err)
@@ -273,21 +393,18 @@ func (w *WrokerState) runReduce(reduceJob *ReduceJob, reduceJobID int) *ReduceJo
 	if err := os.Rename(tempFile.Name(), fileName); err != nil {
 		log.Fatal(err)
 	}
+	w.producedFiles = append(w.producedFiles, fileName)
 
-	reduceJobResult := &ReduceJobResult{}
-	reduceJobResult.OutputFile = fileName
-	return reduceJobResult
+	fileBase64, err := utils.FileToBase64(fileName)
+	if err != nil {
+		panic(err)
+	}
+
+	return CreateReduceJobResult(fileName, fileBase64)
 }
 
-func (w *WrokerState) parseIntermidateFile(fileLocation string) ([]KeyValue, error) {
-	file, err := os.Open(fileLocation)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open file: %v", err)
-	}
-	defer file.Close()
-
+func (w *WorkerState) parseIntermidateFile(file *os.File) ([]KeyValue, error) {
 	var keyValues []KeyValue
-
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -311,15 +428,45 @@ func (w *WrokerState) parseIntermidateFile(fileLocation string) ([]KeyValue, err
 	return keyValues, nil
 }
 
+func (w *WorkerState) RequestFile(args *RequestFileArgs, reply *RequestFileReply) error {
+	if !utils.Contains(w.producedFiles, args.FileName) {
+		// TODO: eroor?
+		panic(nil)
+	}
+
+	fileBase64, err := utils.FileToBase64(args.FileName)
+	if err != nil {
+		return err
+	}
+	reply.FileBase64 = fileBase64
+	return nil
+}
+
+// start a thread that listens for RPCs from worker.go
+func (w *WorkerState) server() {
+	rpc.Register(w)
+	rpc.HandleHTTP()
+	l, e := net.Listen("tcp", fmt.Sprintf(":%v", WorkerPort))
+	if e != nil {
+		log.Fatal("listen error:", e)
+	}
+	go http.Serve(l, nil)
+}
+
 // send an RPC request to the coordinator, wait for the response.
 // usually returns true.
 // returns false if something goes wrong.
 func call(rpcname string, args interface{}, reply interface{}) bool {
-	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
-	sockname := coordinatorSock()
-	c, err := rpc.DialHTTP("unix", sockname)
+	var c *rpc.Client
+	var err error
+	if !IsLocal {
+		c, err = rpc.DialHTTP("tcp", CoordinatorIPAddress+":"+strconv.Itoa(CoordinatorPort))
+	} else {
+		sockname := coordinatorSock()
+		c, err = rpc.DialHTTP("unix", sockname)
+	}
+
 	if err != nil {
-		//log.Fatal("dialing:", err)
 		return false
 	}
 	defer c.Close()
