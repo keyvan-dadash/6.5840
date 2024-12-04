@@ -69,6 +69,7 @@ func Worker(mapf func(string, string) []KeyValue,
 	}
 
 	go worker.sendHeartBeatForEver()
+	go worker.server()
 	worker.runForEver()
 }
 
