@@ -48,12 +48,13 @@ func ihash(key string) int {
 }
 
 type WorkerState struct {
-	ID            string
-	Address       string
-	mapFunc       func(string, string) []KeyValue
-	reduceFunc    func(string, []string) string
-	logger        *log.Logger
-	producedFiles []string
+	ID                 string
+	Address            string
+	CoordinatorAddress string
+	mapFunc            func(string, string) []KeyValue
+	reduceFunc         func(string, []string) string
+	logger             *log.Logger
+	producedFiles      []string
 }
 
 // main/mrworker.go calls this function.
@@ -61,11 +62,12 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	worker := &WorkerState{
-		ID:         uuid.New().String(),
-		Address:    fmt.Sprintf("%v:%v", WorkerIPAddress, WorkerPort),
-		mapFunc:    mapf,
-		reduceFunc: reducef,
-		logger:     log.Default(),
+		ID:                 uuid.New().String(),
+		Address:            fmt.Sprintf("%v:%v", WorkerIPAddress, WorkerPort),
+		CoordinatorAddress: CoordinatorIPAddress + ":" + strconv.Itoa(CoordinatorPort),
+		mapFunc:            mapf,
+		reduceFunc:         reducef,
+		logger:             log.Default(),
 	}
 
 	go worker.sendHeartBeatForEver()
@@ -85,7 +87,7 @@ func (w *WorkerState) sendHeartBeatForEver() error {
 				}
 				reply := HeartBeatReply{}
 
-				ok := call("Coordinator.HeartBeat", &args, &reply)
+				ok := call("Coordinator.HeartBeat", w.CoordinatorAddress, &args, &reply)
 				if ok && reply.ReceivedHeartBeat {
 					continue
 				} else {
@@ -107,7 +109,7 @@ func (w *WorkerState) runForEver() error {
 
 		reply := RequestJobReply{}
 
-		ok := call("Coordinator.RequestJob", &args, &reply)
+		ok := call("Coordinator.RequestJob", w.CoordinatorAddress, &args, &reply)
 		if ok {
 			failedToContact = 0
 			switch reply.Job.JobType {
@@ -276,7 +278,7 @@ func (w *WorkerState) fetchFilesInParallel(inputFiles []File) ([]*os.File, error
 func (w WorkerState) fetchFile(inputFile *File) (*os.File, error) {
 	if !inputFile.IsLocal && !utils.Contains(w.producedFiles, inputFile.FileName) {
 		reply := &RequestFileReply{}
-		ok := call(inputFile.RPCName, &RequestFileArgs{
+		ok := call(inputFile.RPCName, inputFile.NetAddressToGetFile, &RequestFileArgs{
 			FileName: inputFile.FileName,
 		}, reply)
 
@@ -322,7 +324,7 @@ func (w *WorkerState) SubmitJobResult(job *Job) error {
 
 	reply := JobDoneReply{}
 
-	ok := call("Coordinator.JobDone", &args, &reply)
+	ok := call("Coordinator.JobDone", w.CoordinatorAddress, &args, &reply)
 	if ok {
 		return nil
 	} else {
@@ -338,7 +340,7 @@ func (w *WorkerState) SubmitJobFailed(job *Job) error {
 
 	reply := JobFailedReply{}
 
-	ok := call("Coordinator.JobFailed", &args, &reply)
+	ok := call("Coordinator.JobFailed", w.CoordinatorAddress, &args, &reply)
 	if ok {
 		return nil
 	} else {
@@ -457,11 +459,11 @@ func (w *WorkerState) server() {
 // send an RPC request to the coordinator, wait for the response.
 // usually returns true.
 // returns false if something goes wrong.
-func call(rpcname string, args interface{}, reply interface{}) bool {
+func call(rpcname string, addressToCall string, args interface{}, reply interface{}) bool {
 	var c *rpc.Client
 	var err error
 	if !IsLocal {
-		c, err = rpc.DialHTTP("tcp", CoordinatorIPAddress+":"+strconv.Itoa(CoordinatorPort))
+		c, err = rpc.DialHTTP("tcp", addressToCall)
 	} else {
 		sockname := coordinatorSock()
 		c, err = rpc.DialHTTP("unix", sockname)
