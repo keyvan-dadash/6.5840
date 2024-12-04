@@ -1,6 +1,7 @@
 package mr
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net"
@@ -35,12 +36,18 @@ type Coordinator struct {
 	reduceJobsDone bool
 
 	requestLock *sync.Mutex
+
+	endLogFunc context.CancelFunc
+
+	logCtx context.Context
 }
 
 // create a Coordinator.
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce jobs to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
+
+	logCtx, cancel := context.WithCancel(context.Background())
 	c := Coordinator{
 		Workers:            make(map[string]*WorkerInfo),
 		CoordinatorAddress: fmt.Sprintf("%v:%v", CoordinatorIPAddress, CoordinatorPort),
@@ -50,6 +57,8 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		reduceJobsDone:     false,
 		requestLock:        &sync.Mutex{},
 		Jobs:               make(map[string]*Job),
+		endLogFunc:         cancel,
+		logCtx:             logCtx,
 	}
 
 	for _, file := range files {
@@ -71,6 +80,12 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 
 	c.server()
 	go c.observeWorkers()
+	go func() {
+		err := c.writeSimpleLogs(c.logCtx, "coordinator_log.txt")
+		if err != nil {
+			panic(err)
+		}
+	}()
 
 	return &c
 }
@@ -308,6 +323,33 @@ func (c *Coordinator) server() {
 	go http.Serve(l, nil)
 }
 
+func (c *Coordinator) writeSimpleLogs(ctx context.Context, filePath string) error {
+	file, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open log file: %v", err)
+	}
+	defer file.Close()
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			finishedLog := fmt.Sprintf("finished - %s\n", time.Now().Format(time.RFC3339))
+			if _, err := file.WriteString(finishedLog); err != nil {
+				return fmt.Errorf("failed to write to log file: %v", err)
+			}
+			return nil
+		case <-ticker.C:
+			aliveLog := fmt.Sprintf("I am alive - %s\n", time.Now().Format(time.RFC3339))
+			if _, err := file.WriteString(aliveLog); err != nil {
+				return fmt.Errorf("failed to write to log file: %v", err)
+			}
+		}
+	}
+}
+
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
@@ -334,6 +376,11 @@ func (c *Coordinator) Done() bool {
 				panic(err)
 			}
 		}
+	}
+
+	if ret {
+		c.endLogFunc()
+		time.Sleep(1 * time.Second)
 	}
 
 	return ret
